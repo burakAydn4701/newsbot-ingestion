@@ -11,12 +11,12 @@ def connect_postgres():
     )
 
 
-def insert_article(pg_cursor, article_id, url, title, full_text, ozet, ilk_cekilme_tarihi, onem_rank=None):
+def insert_article(pg_cursor, article_id, url, title, full_text, ozet, ilk_cekilme_tarihi, onem_rank=None, kategori=None):
     pg_cursor.execute("""
-        INSERT INTO news_articles (article_id, article_url, title, full_text, ozet, ilk_cekilme_tarihi, onem_rank)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO news_articles (article_id, article_url, title, full_text, ozet, ilk_cekilme_tarihi, onem_rank, category)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (article_id) DO NOTHING
-    """, (article_id, url, title, full_text, ozet, ilk_cekilme_tarihi, onem_rank))
+    """, (article_id, url, title, full_text, ozet, ilk_cekilme_tarihi, onem_rank, kategori))
 
 
 def insert_chunks(pg_cursor, article_id, url, chunks, embeddings, ilk_cekilme_tarihi, onem_rank=None):

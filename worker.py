@@ -67,12 +67,12 @@ def run_cycle(last_id):
         for article in new_articles:
             article_id = None
             try:
-                article_id, title, url, content, ozet, ilk_cekilme_tarihi, onem_rank = article
+                article_id, title, url, content, ozet, ilk_cekilme_tarihi, onem_rank, kategori = article
                 title = title.encode("utf-8", errors="ignore").decode("utf-8") if title else ""
                 content = clean_html(content)
                 ozet = clean_html(ozet)
 
-                insert_article(pg_cursor, article_id, url, title, content, ozet, ilk_cekilme_tarihi, onem_rank)
+                insert_article(pg_cursor, article_id, url, title, content, ozet, ilk_cekilme_tarihi, onem_rank, kategori)
 
                 chunks = chunk_text(content)
                 embeddings = get_embeddings([f"passage: {c}" for c in chunks])

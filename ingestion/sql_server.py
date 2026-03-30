@@ -18,7 +18,7 @@ def fetch_new_articles(last_id):
     conn = connect_sql_server()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT id, baslik, orijinal_URL, metin, ozet, ilk_cekilme_tarihi, onem_rank
+        SELECT id, baslik, orijinal_URL, metin, ozet, ilk_cekilme_tarihi, onem_rank, kategori
         FROM dbo.haberler WITH (NOLOCK)
         WHERE id > ? AND HC = 1
         ORDER BY id

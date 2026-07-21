@@ -1,4 +1,10 @@
 # -*- coding: utf-8 -*-
+import os
+# Load the embedding model from the local HF cache without contacting
+# huggingface.co, so a slow/unreachable HF can't hang worker startup.
+# (Must be set before importing ingestion.embeddings, which loads the model.)
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 import time
 from bs4 import BeautifulSoup
 from ingestion.sql_server import fetch_candidate_ids, fetch_articles_by_ids

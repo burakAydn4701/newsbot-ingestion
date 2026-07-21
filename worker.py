@@ -1,11 +1,28 @@
 # -*- coding: utf-8 -*-
 import time
 from bs4 import BeautifulSoup
-from ingestion.sql_server import fetch_new_articles
-from ingestion.postgres import connect_postgres, insert_article, insert_chunks
+from ingestion.sql_server import fetch_candidate_ids, fetch_articles_by_ids
+from ingestion.postgres import (
+    connect_postgres,
+    insert_article,
+    insert_chunks,
+    fetch_existing_ids,
+)
 from ingestion.chunks import chunk_text
 from ingestion.embeddings import get_embeddings
-from config import SLEEP_SECONDS, CHECKPOINT_SIZE
+from config import SLEEP_SECONDS
+
+# How many recent days to re-scan each cycle for un-ingested articles. Must be
+# comfortably larger than the longest delay between an article appearing and
+# its HC flag flipping to 1, and smaller than the 10-day Postgres retention
+# below (so we never re-add an article that was just deleted for age).
+WINDOW_DAYS = 7
+
+# SQL Server caps the number of query parameters (~2100); fetch missing rows in
+# batches well under that.
+BATCH_SIZE = 500
+
+RETENTION_INTERVAL = "10 days"
 
 
 def clean_html(raw_html):
@@ -20,97 +37,83 @@ def clean_html(raw_html):
     return text.encode("utf-8", errors="ignore").decode("utf-8")
 
 
-def ensure_state_table():
-    pg_conn = connect_postgres()
-    pg_cursor = pg_conn.cursor()
-    pg_cursor.execute("""
-        CREATE TABLE IF NOT EXISTS ingestion_state (
-            name TEXT PRIMARY KEY,
-            last_id BIGINT
-        )
-    """)
-    pg_conn.commit()
-    pg_cursor.close()
-    pg_conn.close()
+def _batches(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 
-def load_last_id():
-    pg_conn = connect_postgres()
-    pg_cursor = pg_conn.cursor()
-    pg_cursor.execute("SELECT last_id FROM ingestion_state WHERE name='news';")
-    row = pg_cursor.fetchone()
-    pg_cursor.close()
-    pg_conn.close()
-    return row[0] if row else 0
-
-
-def run_cycle(last_id):
-    new_articles = fetch_new_articles(last_id)
-    total_articles = len(new_articles)
-    print(f"[INFO] Found {total_articles} new articles.")
-
-    if not new_articles:
-        return last_id
-
-    pg_conn = connect_postgres()
-    pg_cursor = pg_conn.cursor()
-
+def process_article(pg_conn, pg_cursor, article):
+    """Insert one article + its chunks in a single transaction. Returns True on
+    success. On any error the transaction is rolled back and the article stays
+    'missing', so the next cycle retries it (no permanent skip)."""
+    article_id = None
     try:
-        pg_cursor.execute("DELETE FROM news_chunks WHERE ilk_cekilme_tarihi < NOW() - INTERVAL '10 days';")
-        pg_cursor.execute("DELETE FROM news_articles WHERE ilk_cekilme_tarihi < NOW() - INTERVAL '10 days';")
-        deleted_count = pg_cursor.rowcount
+        article_id, title, url, content, ozet, ilk_cekilme_tarihi, onem_rank, kategori = article
+        title = title.encode("utf-8", errors="ignore").decode("utf-8") if title else ""
+        content = clean_html(content)
+        ozet = clean_html(ozet)
+
+        insert_article(pg_cursor, article_id, url, title, content, ozet, ilk_cekilme_tarihi, onem_rank, kategori)
+
+        chunks = chunk_text(content)
+        if chunks:
+            embeddings = get_embeddings([f"passage: {c}" for c in chunks])
+            insert_chunks(pg_cursor, article_id, url, chunks, embeddings, ilk_cekilme_tarihi, onem_rank)
+
         pg_conn.commit()
-        if deleted_count > 0:
-            print(f"[INFO] Dropped {deleted_count} old records.")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed on article ID {article_id}: {e}")
+        pg_conn.rollback()
+        return False
 
-        inserted_count = 0
-        for article in new_articles:
-            article_id = None
-            try:
-                article_id, title, url, content, ozet, ilk_cekilme_tarihi, onem_rank, kategori = article
-                title = title.encode("utf-8", errors="ignore").decode("utf-8") if title else ""
-                content = clean_html(content)
-                ozet = clean_html(ozet)
 
-                insert_article(pg_cursor, article_id, url, title, content, ozet, ilk_cekilme_tarihi, onem_rank, kategori)
+def run_cycle():
+    candidate_ids = fetch_candidate_ids(WINDOW_DAYS)
+    if not candidate_ids:
+        print("[INFO] No eligible articles in window.")
+        return
 
-                chunks = chunk_text(content)
-                embeddings = get_embeddings([f"passage: {c}" for c in chunks])
-                insert_chunks(pg_cursor, article_id, url, chunks, embeddings, ilk_cekilme_tarihi, onem_rank)
+    pg_conn = connect_postgres()
+    pg_cursor = pg_conn.cursor()
+    try:
+        # Retention: drop records older than the retention window.
+        pg_cursor.execute(
+            f"DELETE FROM news_chunks WHERE ilk_cekilme_tarihi < NOW() - INTERVAL '{RETENTION_INTERVAL}';"
+        )
+        pg_cursor.execute(
+            f"DELETE FROM news_articles WHERE ilk_cekilme_tarihi < NOW() - INTERVAL '{RETENTION_INTERVAL}';"
+        )
+        pg_conn.commit()
 
-                last_id = max(last_id, article_id)
-                pg_cursor.execute("""
-                    INSERT INTO ingestion_state(name, last_id)
-                    VALUES('news', %s)
-                    ON CONFLICT(name) DO UPDATE SET last_id = EXCLUDED.last_id
-                """, (last_id,))
-                pg_conn.commit()
-                inserted_count += 1
+        # Anti-join: process only the eligible articles not already ingested.
+        existing = fetch_existing_ids(pg_cursor, candidate_ids)
+        missing_ids = [i for i in candidate_ids if i not in existing]
+        print(f"[INFO] {len(candidate_ids)} eligible, {len(existing)} already ingested, {len(missing_ids)} to process.")
 
-                if inserted_count % CHECKPOINT_SIZE == 0:
-                    print(f"[CHECKPOINT] Inserted {inserted_count}/{total_articles}. Last ID: {last_id}")
+        if not missing_ids:
+            return
 
-            except Exception as e:
-                print(f"[ERROR] Failed on article ID {article_id}: {e}")
-                pg_conn.rollback()
-                continue
+        inserted = 0
+        for batch in _batches(missing_ids, BATCH_SIZE):
+            for article in fetch_articles_by_ids(batch):
+                if process_article(pg_conn, pg_cursor, article):
+                    inserted += 1
+            print(f"[CHECKPOINT] Inserted {inserted}/{len(missing_ids)}.")
 
-        print(f"[INFO] Finished inserting {inserted_count}/{total_articles}. Last ID: {last_id}")
-
+        print(f"[INFO] Finished. Inserted {inserted}/{len(missing_ids)}.")
     finally:
         pg_cursor.close()
         pg_conn.close()
 
-    return last_id
-
 
 def run_worker():
-    ensure_state_table()
-    last_id = load_last_id()
-    print(f"[INFO] Starting ingestion. Last processed ID: {last_id}")
-
+    print(f"[INFO] Starting ingestion. Re-scan window: {WINDOW_DAYS} days.")
     while True:
-        last_id = run_cycle(last_id)
+        try:
+            run_cycle()
+        except Exception as e:
+            print(f"[ERROR] Cycle failed: {e}")
         print(f"[INFO] Sleeping for {SLEEP_SECONDS}s...")
         time.sleep(SLEEP_SECONDS)
 

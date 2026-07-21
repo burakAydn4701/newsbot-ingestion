@@ -11,6 +11,18 @@ def connect_postgres():
     )
 
 
+def fetch_existing_ids(pg_cursor, ids):
+    """Which of the given article ids are already ingested (present in
+    news_articles). The worker processes only the ones NOT returned here."""
+    if not ids:
+        return set()
+    pg_cursor.execute(
+        "SELECT article_id FROM news_articles WHERE article_id = ANY(%s)",
+        (list(ids),),
+    )
+    return {r[0] for r in pg_cursor.fetchall()}
+
+
 def insert_article(pg_cursor, article_id, url, title, full_text, ozet, ilk_cekilme_tarihi, onem_rank=None, kategori=None):
     pg_cursor.execute("""
         INSERT INTO news_articles (article_id, article_url, title, full_text, ozet, ilk_cekilme_tarihi, onem_rank, category)
